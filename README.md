@@ -10,6 +10,12 @@
 -->
 # dsh-sec-tools
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-sec-tools"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 安全工具面封装：把 WSL 成熟渗透工具封装为结构化 DSH 工具，窄而深可组合。
 > DeepSeek Harness 自研插件 · v0.1.0
 
