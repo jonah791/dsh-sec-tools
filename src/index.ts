@@ -17,12 +17,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   runNmap, runMasscan, runGobuster, runSubfinder, runWhatweb, runDnsrecon,
 } from './recon.js'
 import { runSqlmap, runNikto, runHydra } from './attack.js'
 import { runHashcat, runJohn } from './crack.js'
 import { DEFAULT_TIMEOUT, LONG_TIMEOUT } from './wsl.js'
+import { buildStamp, readPackageVersion, tracedExecute } from './trace.js'
 
 export const name = 'dsh-sec-tools'
 export const inject = ['tools'] as const
@@ -61,7 +64,16 @@ const wrapExecute = (fn: (args: Any) => Promise<Any>) => async (args: Any) => {
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('sec-tools')
-  const reg = (tool: Any) => ctx.tools.register(defineTool(tool))
+  // ── 可维护性 S4：自证轨迹（`<DSH_HOME>/sec-tools-trace.jsonl`）────────────────
+  // 单一切面：12 个工具**全部**经 `reg()` 注册，轨迹接线只在这一处落笔（漏一处即新缺陷）。
+  // 工具内部的 `unsafeArg()` 闸门在触碰 WSL 之前拒绝 ⇒ 那些调用落 `gate` 阶段（防线的一手证据）。
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const SELF = join(HERE, 'index.js')
+  const BUILD = buildStamp(SELF, readPackageVersion(SELF))
+  const reg = (tool: Any) => ctx.tools.register(defineTool({
+    ...tool,
+    execute: tracedExecute({ tool: String(tool.name), build: BUILD }, tool.execute as (a: Any) => Promise<Any>),
+  }))
   const baseProps: Record<string, Any> = {
     ok: { type: 'boolean', required: true }, error: { type: 'string' }, result: { type: 'string' },
     exitCode: { type: 'number' }, stderr: { type: 'string' }, durationMs: { type: 'number' },

@@ -75,6 +75,68 @@
 | 参数校验 | `src/recon.ts:11` `sq` / `:16` `validUrl` / `:23` `validTarget` / `:28` `validWord` | 每次构命令前 |
 | 日志 | `src/index.ts:63` `ctx.logger('sec-tools')` · `:248` 就绪自报「11 工具：6 侦察 + 3 利用 + 2 密码」 | apply |
 
+### 4.4 自证轨迹契约（可维护性 S4 · 2026-09-14）
+
+**落盘路径（单一真源）**：`<DSH_HOME>/sec-tools-trace.jsonl`，写入者是
+`src/trace.ts:resolveHome()`（`DSH_HOME` → 回退 `homedir()/.dsh`）+ `tracePath(home)`。
+**一行一阶段**（单行 JSON，`atMs` 单调），可 `tail` / `grep`。
+
+**行 schema**（`src/trace.ts:TraceEntry`；固定键序 `serializeTraceEntry` 锁住）：
+
+| 字段 | 类型 | 出现阶段 | 含义 |
+|------|------|---------|------|
+| `atMs` | number | 全部 | 写入时刻（ms epoch） |
+| `phase` | `'begin' \| 'gate' \| 'end'` | 全部 | **阶段枚举**：一次调用恒为 `begin` →（`gate` **或** `end`） |
+| `tool` | string | 全部 | 工具名（如 `sec_nmap`） |
+| `build` | string | 全部 | `<package.version>@<lib/index.js mtime ms>`（Q1：线上跑的是哪个构建） |
+| `pid` | number | 全部 | 进程 pid |
+| `target` | string? | 全部 | `target` → `url`（结构化 host+path）→ `domain` |
+| `args` | string? | `begin` | 关键参数摘要（脱敏；敏感键只记 `<N chars>`） |
+| `durationMs` | number | 全部 | `begin`=0；其余=全程实耗（Q5） |
+| `ok` | boolean? | `gate`/`end` | 工具返回值里显式的 `ok` |
+| `exitCode` | number? | `end` | 子进程退出码（`gate` 行**恒缺省**——闸门在触碰 WSL 之前拒绝） |
+| `resultBytes` / `stderrBytes` | number? | `end` | 量级（**不落正文**） |
+| `break` | string? | `gate`/`end` | `classifyBreak()` 分类（仅 `ok=false` 时出现） |
+| `error` | string? | `gate`/`end` | 分类前缀 + **已 `scrub`** 的截断 200 字符文本 |
+
+**阶段枚举的语义（本插件最关键的一条）**：
+
+- `gate` = **在触碰 WSL 之前**被闸门拒绝（`unsafeArg()` / `validUrl()` / `validTarget()`）。
+  该行同时证明两件事：**防线拦下了什么**，以及**这一发没有产生任何子进程**（故无 `exitCode`）。
+- `end` = 已进入执行路径的一切结局（成功、工具缺失、子进程非零退出、spawn 异常）。
+
+**分类枚举**（`classifyBreak`，可 grep；`isGate()` 判是否 `gate/` 前缀）：
+
+| 分类 | 触发文案（与 `src/commands.ts` 同源） | 触碰 WSL |
+|------|------------------------------------|---------|
+| `gate/unsafe-arg` | `含 shell 元字符` / `类型不符` | ✗ |
+| `gate/invalid-url` | `url 需 http(s)://` / `url 含特殊字符` | ✗ |
+| `gate/invalid-target` | `格式无效` | ✗ |
+| `missing-tool` | `WSL 未安装` | ✓（toolExists 探测） |
+| `missing-file` | `不存在` | ✓ |
+| `bad-args` | `必填` / `需提供` | ✗（但非闸门类，仍落 `end`——它属于参数完备性，不是注入防线） |
+| `tool-exit` | `执行失败` | ✓ |
+| `empty` / `other` | 空错误 / 其余 | ? |
+
+**判据单一真源（§5.22 规则 4）**：分类所依赖的文案与 `commands.ts` 的实际输出**由单测交叉验证**
+（`tests/trace.test.mjs`「判据单一真源」：用 `unsafeArg()`/`validUrl()`/`validTarget()` 的**真实返回值**
+喂 `classifyBreak`）——文案漂移会让测试红，而不是让防线静默失效。
+
+**隐私红线**：`pass` / `password` / `user` / `username` / `hash` / `hashFile` / `cookie` / `token` /
+`authorization` / `secret` / `form`（hydra 解析模板，**可能**内嵌字面凭据，从严）**只记 `<N chars>`**；
+`url` 内嵌 `user:pass@` 由 `summarizeUrl` 结构性剥离；`error` 落盘前过 `scrub(text, secrets)`。
+`target` / `url` / `domain` / `ports` / `scanType` / `extra` / `mode` / `wordlist` / `level` / `rate` 等
+业务键**保留**（排障要看，非凭据）。
+
+**调用点清单**：
+
+| 调用方 | 调用点（文件:符号） | 时机 |
+|-------|------------------|------|
+| 单一切面 | `src/index.ts:apply` → `reg(tool)`（**12 个工具全部**经它注册，轨迹接线只此一处） | 挂载时注册 |
+| 接线 | `src/index.ts:apply` → `tracedExecute({tool, build}, tool.execute)` | 每次调用 |
+| 落盘 | `src/trace.ts:tracedExecute` → `safeTrace` → `appendTraceEntry`（吞错返回 bool） | 每次调用两行 |
+| 读取 | `src/trace.ts:readTraceEntries`（坏行/半行/空行/缺失/目录 → 空数组） | 诊断时 |
+
 ## 5 · 边界与信任
 
 - **能力边界 ≠ 沙箱**：本插件防的是参数注入（`sq` 包裹 + URL/target 白名单校验）与工具缺失（预检）；**不防**被调用工具自身的行为、不防误用授权范围。
@@ -108,6 +170,12 @@
 | A14 | **原样拼接参数有闸门**（新增防线） | `unsafeArg()` 拦 `; | & \` $ ( ) { } < > " ' \` 与换行；放行合法多参数 `-O -A`；`runNmap/runGobuster/runMasscan/runSqlmap/runHydra` 的元字符输入在**触碰 WSL 之前**即被拒 | ✅ 2026-09-14 |
 | A15 | 闸门时序：格式校验 → 元字符闸门 → 工具探测 | `tests/commands.test.mjs`「target 非法优先于元字符闸门」：`runNmap({target:'bad target', extra:'; id'})` → 报 `target 格式无效` | ✅ 2026-09-14 |
 | A16 | **`hydra` 凭据不再重复拼接**（真缺陷修复） | 修复前 `buildHydraCmd({user:'u',pass:'p'})` = `hydra 'u':'p':'p'`（hydra 按首个冒号切分 ⇒ 密码成为 `p:p`，凭据永远不匹配）；修复后 = `hydra 'u':'p'`，单测锁住 | ✅ 2026-09-14 |
+| A17 | **闸门可见性**：被 `unsafeArg` 拒绝的调用落**独立 `gate` 阶段**且无 `exitCode` | `tests/trace.test.mjs`「闸门可见性」：喂 `unsafeArg` 的真实拒绝文本 → 断言行序 `['begin','gate']`、`break='gate/unsafe-arg'`、`exitCode===undefined` | ✅ 2026-09-14 |
+| A18 | 分类判据与闸门文案**同源**（不靠两处各自维护） | `tests/trace.test.mjs`「判据单一真源」：`unsafeArg()`/`validUrl()`/`validTarget()` 真实返回值 → `classifyBreak` 必须归到 `gate/*`；放行样本不得误判 | ✅ 2026-09-14 |
+| A19 | 观测不反噬：不可写路径 → `false` 且不抛、返回值/异常传播不变 | `tests/trace.test.mjs`「尸体测试」「观测失败不反噬」「异常原样重抛（同一对象）」 | ✅ 2026-09-14 |
+| A20 | 隐私红线：口令/用户名/哈希原文/hydra form **绝不出现在落盘行里** | `tests/trace.test.mjs` 隐私尸体测试：喂秘密参数 → 断言文件内搜不到，且 `pass=<N chars>`/`url=<host+path>` 出现 | ✅ 2026-09-14 |
+| A21 | 回归能力扩充后仍绿 | `npm test` → **40 pass / 0 fail**（既有 20 + 轨迹 20） | ✅ 2026-09-14 |
+| A22 | 线上自证（五问一条命令可答） | `tail -3 <DSH_HOME>/sec-tools-trace.jsonl` → `tool`+`build` / `target`+`args` / `ok`+`exitCode` / `durationMs` 一齐可见 | **待线上验收**（需一次真实工具调用） |
 
 ## 8 · 与实现的关系
 
@@ -119,6 +187,28 @@
 - **回退**：① 代码回退 `git -C E:/alice/self-plugins/dsh-sec-tools revert <sha>` + 重新 `npm run build`，再经哨兵协议重启使新构建生效；② 版本回退按 package version（当前 `0.1.0`）；③ 结构性回退 `plugin_unmount`（插件名 `dsh-sec-tools`）——11 个工具从工具面消失，WSL 侧工具与已装环境不受影响；④ 单点应急：组合行里给 `config.enabled: false` **不能**关闭工具（见 A9 证伪），要停用只能走 `plugin_stop`/卸载。
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 · 自证轨迹层（可维护性 S4，零业务行为变更）**
+  - **缺口**：12 个工具都经 WSL 执行外部渗透工具，却只有 `ctx.logger` 的 ready 行（宿主 logger **不落盘**）
+    ⇒ 事后无法回答「哪一发被 `unsafeArg()` 闸门挡下、断在哪一级、stdout 多长、花了多久」。
+  - **补的语义（新契约）**：新增 `src/trace.ts`（纯函数 + 薄 IO）+ `<DSH_HOME>/sec-tools-trace.jsonl`
+    （`begin` → `gate`/`end`），契约与调用点清单见 §4.4；切面**只有一处**——
+    `src/index.ts:apply` 的 `reg()`，不在 12 个 `execute` 里各改一遍。
+  - **补的语义（本插件特有的观测点）**：**闸门拒绝具有独立阶段 `gate`**。
+    理由：`unsafeArg()` 闸门是「在触碰 WSL 之前拒绝」的纵深防御（6 个原样拼接参数），
+    **「闸门拒绝了什么」是防线是否真在工作的一手证据**——混进 `end` 里就再也不能一条 `grep` 证明防线活着。
+    `gate` 行**恒无 `exitCode`**，这本身就是「没有产生子进程」的机器可读证据。
+  - **补的语义（判据单一真源）**：`classifyBreak` 依赖的是 `commands.ts` 的错误文案——
+    单测用 `unsafeArg()`/`validUrl()`/`validTarget()` 的**真实返回值**交叉验证，文案漂移即测试红。
+  - **补的语义（隐私红线，此前无此约束）**：口令/用户名/哈希原文/cookie/token/hydra `form`
+    **只记长度**；`url` 内嵌凭据**结构性剥离**；`error` 落盘前过 `scrub()`。
+  - **行为变更清单**：**无**。工具签名/参数/schema/render 逐字不变；`tracedExecute` 只做「落两行 + 原样转发」，
+    异常**原样重抛同一个对象**——由单测钉住。
+  - **测试**：`tests/trace.test.mjs`（20 条）。全仓 20 → **40/40**。
+  - **踩坑登记（给自己也给后来者）**：测试文件头注释里写 `**闸门分类**/路径` 时，
+    `**` + `/` 拼出的 `*/` **提前闭合了块注释**，整个文件变成语法错（`SyntaxError: Unexpected token '**'`）
+    ——注释里避免「星号紧跟斜杠」的写法。
+  - **未决**：轨迹无轮转（见 §10 U7）。
 
 （I3：每次事故/实践暴露的语义缺口当场回写）
 
@@ -145,3 +235,7 @@
 - **U5** 原样拼接参数的闸门是否够（本次新增登记）：`unsafeArg` 只挡元字符，不挡「合法但危险」的参数（如 `--os-shell`、`--script=*`、`-p-` 全端口）。是否需要白名单式参数校验？倾向：保持现闸门（防注入）+ 在工具 description 里显式声明「危险参数自担」，不在插件层做策略判断。
 - **U6** `number` 参数未做运行时类型校验（本次新增登记）：`port`/`threads`/`level`/`risk`/`tune`/`agility` 若被传字符串（绕过工具 schema）会原样进命令行。倾向：与 U5 一并评估——若要挡，需在 runX 加 `Number.isInteger` 检查（`commands.ts` 已有位置）。
 - **U4** 「有 stdout 即判成功」的失败判据（`!r.ok && !r.stdout`）会把部分失败当成功——是否改为暴露 `ok` 与 `exitCode` 双语义由调用者裁决？
+  → **部分缓解（2026-09-14）**：轨迹 `end` 行**同时**落 `ok` 与 `exitCode`/`resultBytes`/`stderrBytes`，
+  排障时可事后判定「这是真成功还是部分失败」。但**工具返回值本身未改**（本轮零行为变更），语义歧义仍存。
+- **U7** 轨迹**无轮转/无上限**（2026-09-14 新增登记）：`sec-tools-trace.jsonl` 长期运行会单文件增长。
+  倾向：本批 4 个插件统一在运维层处理（与 §5.22 既有轨迹同款），**未决**。

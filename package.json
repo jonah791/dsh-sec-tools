@@ -1,6 +1,6 @@
 {
   "name": "dsh-sec-tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "安全工具面封装：把 WSL 成熟渗透工具（nmap/sqlmap/hashcat 等）封装为结构化 DSH 工具，spawnWsl 模式，窄而深可组合",
   "type": "module",
   "main": "lib/index.js",
