@@ -7,6 +7,7 @@
 
 import { spawnWsl, toolExists, type WslResult } from './wsl.js'
 import { sq, fileExists } from './recon.js'
+import { buildHashcatCmd, buildJohnCmd } from './commands.js'
 
 // ═══════════════ hashcat ═══════════════
 
@@ -29,12 +30,7 @@ export interface HashcatOptions {
 export async function runHashcat(opts: HashcatOptions): Promise<{ ok: boolean; error?: string; result?: string; exitCode?: number; stderr?: string }> {
   if (!opts.hash && !opts.hashFile) return { ok: false, error: '需提供 hash 或 hashFile' }
   if (!(await toolExists('hashcat'))) return { ok: false, error: 'WSL 未安装 hashcat' }
-  const input = opts.hashFile ? sq(opts.hashFile) : sq(opts.hash!)
-  const attack = opts.attack ?? 0
-  const wl = opts.wordlist ?? '/usr/share/wordlists/rockyou.txt'
-  const maskPart = opts.mask ? ` ${sq(opts.mask)}` : ''
-  const wlPart = attack === 3 ? '' : ` ${sq(wl)}`
-  const cmd = `hashcat -m ${opts.mode} -a ${attack} ${input}${wlPart}${maskPart} --force --show 2>&1`
+  const cmd = buildHashcatCmd(opts)
   const r: WslResult = await spawnWsl(cmd, opts.timeoutMs ?? 600_000)
   if (!r.ok && !r.stdout) return { ok: false, error: `hashcat 执行失败: ${r.stderr.slice(0, 400)}`, exitCode: r.exitCode }
   return { ok: true, result: r.stdout, exitCode: r.exitCode }
@@ -56,9 +52,7 @@ export async function runJohn(opts: JohnOptions): Promise<{ ok: boolean; error?:
   if (!opts.hashFile) return { ok: false, error: 'hashFile 必填（WSL 内路径）' }
   if (!(await toolExists('john'))) return { ok: false, error: 'WSL 未安装 john' }
   if (!(await fileExists(opts.hashFile))) return { ok: false, error: `哈希文件不存在（WSL 路径）: ${opts.hashFile}` }
-  const fmtFlag = opts.format ? ` --format=${sq(opts.format)}` : ''
-  const wlFlag = opts.wordlist ? ` --wordlist=${sq(opts.wordlist)}` : ''
-  const cmd = `john${fmtFlag}${wlFlag} ${sq(opts.hashFile)} 2>&1; echo '---SHOW---'; john --show ${sq(opts.hashFile)} 2>&1`
+  const cmd = buildJohnCmd(opts)
   const r = await spawnWsl(cmd, opts.timeoutMs ?? 600_000)
   if (!r.ok && !r.stdout) return { ok: false, error: `john 执行失败: ${r.stderr.slice(0, 400)}`, exitCode: r.exitCode }
   return { ok: true, result: r.stdout, exitCode: r.exitCode }

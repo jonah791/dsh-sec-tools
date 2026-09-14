@@ -7,6 +7,7 @@
 
 import { spawnWsl, toolExists, type WslResult } from './wsl.js'
 import { sq, validTarget, validUrl } from './recon.js'
+import { unsafeArg, buildSqlmapCmd, buildNiktoCmd, buildHydraCmd } from './commands.js'
 
 // ═══════════════ sqlmap ═══════════════
 
@@ -31,18 +32,10 @@ export interface SqlmapOptions {
 export async function runSqlmap(opts: SqlmapOptions): Promise<{ ok: boolean; error?: string; result?: string; exitCode?: number; stderr?: string }> {
   const u = validUrl(opts.url)
   if (!u.ok) return { ok: false, error: u.error }
+  const bad = unsafeArg(opts.extra, 'extra')
+  if (bad) return { ok: false, error: bad }
   if (!(await toolExists('sqlmap'))) return { ok: false, error: 'WSL 未安装 sqlmap' }
-  const paramFlag = opts.param ? ` -p ${sq(opts.param)}` : ''
-  const action = opts.action ?? 'dbs'
-  const actionFlag = action === 'dbs' ? '--dbs'
-    : action === 'current-db' ? '--current-db'
-    : action === 'tables' ? (opts.db ? `-D ${sq(opts.db)} --tables` : '--tables')
-    : action === 'dump' ? (opts.db && opts.table ? `-D ${sq(opts.db)} -T ${sq(opts.table)} --dump` : '--dump')
-    : '--dbs'
-  const lvl = opts.level ?? 1
-  const rsk = opts.risk ?? 1
-  const extraFlag = opts.extra ? ` ${opts.extra}` : ''
-  const cmd = `sqlmap -u ${sq(opts.url)}${paramFlag} ${actionFlag} --batch --level ${lvl} --risk ${rsk}${extraFlag} 2>&1`
+  const cmd = buildSqlmapCmd(opts)
   const r: WslResult = await spawnWsl(cmd, opts.timeoutMs ?? 600_000)
   if (!r.ok && !r.stdout) return { ok: false, error: `sqlmap 执行失败: ${r.stderr.slice(0, 400)}`, exitCode: r.exitCode }
   return { ok: true, result: r.stdout, exitCode: r.exitCode }
@@ -61,8 +54,7 @@ export async function runNikto(opts: NiktoOptions): Promise<{ ok: boolean; error
   const u = validUrl(opts.url)
   if (!u.ok) return { ok: false, error: u.error }
   if (!(await toolExists('nikto'))) return { ok: false, error: 'WSL 未安装 nikto' }
-  const tuneFlag = opts.tune ? ` -Tuning ${opts.tune}` : ''
-  const cmd = `nikto -h ${sq(opts.url)}${tuneFlag} -nointeractive 2>&1`
+  const cmd = buildNiktoCmd(opts)
   const r = await spawnWsl(cmd, opts.timeoutMs ?? 600_000)
   if (!r.ok && !r.stdout) return { ok: false, error: `nikto 执行失败: ${r.stderr.slice(0, 400)}`, exitCode: r.exitCode }
   return { ok: true, result: r.stdout, exitCode: r.exitCode }
@@ -93,20 +85,10 @@ export interface HydraOptions {
 
 export async function runHydra(opts: HydraOptions): Promise<{ ok: boolean; error?: string; result?: string; exitCode?: number; stderr?: string }> {
   if (!validTarget(opts.target)) return { ok: false, error: 'target 格式无效' }
+  const bad = unsafeArg(opts.service, 'service')
+  if (bad) return { ok: false, error: bad }
   if (!(await toolExists('hydra'))) return { ok: false, error: 'WSL 未安装 hydra' }
-  const cred = opts.user && opts.pass
-    ? `${sq(opts.user)}:${sq(opts.pass)}`
-    : opts.user
-    ? `${sq(opts.user)} `
-    : opts.userlist ? `-L ${sq(opts.userlist)} ` : ''
-  const passPart = opts.pass ? `:${sq(opts.pass)}` : opts.passlist ? ` -P ${sq(opts.passlist)}` : ''
-  const portFlag = opts.port ? ` -s ${opts.port}` : ''
-  const thrFlag = opts.threads ? ` -t ${opts.threads}` : ''
-  // 处理 http-post-form 特殊协议（service 参数含 :// 形式）
-  const servicePart = opts.form
-    ? `http-post-form ${sq(opts.form)}`
-    : `${opts.service}`
-  const cmd = `hydra ${cred}${passPart}${portFlag}${thrFlag} -f ${sq(opts.target)} ${servicePart} 2>&1`
+  const cmd = buildHydraCmd(opts)
   const r = await spawnWsl(cmd, opts.timeoutMs ?? 300_000)
   if (!r.ok && !r.stdout) return { ok: false, error: `hydra 执行失败: ${r.stderr.slice(0, 400)}`, exitCode: r.exitCode }
   return { ok: true, result: r.stdout, exitCode: r.exitCode }

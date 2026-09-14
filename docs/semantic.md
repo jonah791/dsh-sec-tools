@@ -103,12 +103,18 @@
 | A9 | `enabled=false` 会禁用工具面（直觉预期） | **证伪**：`src/index.ts:247` 仅 `if (config.enabled) logger.info(...)`——工具照常注册 | 已实测（证伪，见 §10） |
 | A10 | 缺工具时返回明确错误而非崩溃 | 在 WSL 内临时隐藏某工具（如 `PATH` 剔除）后调用对应 `sec_*`，应得 `{ok:false,error:'WSL 未安装 X'}` | 待验收 |
 | A11 | 真实扫描可跑通并结构化返回 | 线上跑 `sec_nmap {target: 'scanme.nmap.org'}`：`ok=true`、`exitCode` 与 `result` 含端口列表、`durationMs>0` | 待验收 |
+| A12 | 回归能力存在且绿 | `npm test`（= `node --test "tests/*.test.mjs"`，跑 `lib/` 产物）→ **20 pass / 0 fail** | ✅ 2026-09-14 |
+| A13 | 受校验参数无法逃逸（A3 的离线版） | `tests/commands.test.mjs`：`sq()` 包裹 + 内部单引号转义；`buildNmapCmd({target:"a.com'; id; '"})` 断言转义形态 | ✅ 2026-09-14 |
+| A14 | **原样拼接参数有闸门**（新增防线） | `unsafeArg()` 拦 `; | & \` $ ( ) { } < > " ' \` 与换行；放行合法多参数 `-O -A`；`runNmap/runGobuster/runMasscan/runSqlmap/runHydra` 的元字符输入在**触碰 WSL 之前**即被拒 | ✅ 2026-09-14 |
+| A15 | 闸门时序：格式校验 → 元字符闸门 → 工具探测 | `tests/commands.test.mjs`「target 非法优先于元字符闸门」：`runNmap({target:'bad target', extra:'; id'})` → 报 `target 格式无效` | ✅ 2026-09-14 |
+| A16 | **`hydra` 凭据不再重复拼接**（真缺陷修复） | 修复前 `buildHydraCmd({user:'u',pass:'p'})` = `hydra 'u':'p':'p'`（hydra 按首个冒号切分 ⇒ 密码成为 `p:p`，凭据永远不匹配）；修复后 = `hydra 'u':'p'`，单测锁住 | ✅ 2026-09-14 |
 
 ## 8 · 与实现的关系
 
-- 主实现：`src/index.ts`（注册/包装/渲染）、`src/wsl.ts`（执行）、`src/recon.ts`/`src/attack.ts`/`src/crack.ts`（三面实现）；构建产物 `lib/*.js`（`tsc -p tsconfig.json`）。
+- 主实现：`src/index.ts`（注册/包装/渲染）、`src/wsl.ts`（执行）、`src/commands.ts`（**纯层，零 IO**：`sq`/`validUrl`/`validTarget`/`validWord`/`hasShellMeta`/`unsafeArg` + 11 个 `build*Cmd` 命令构造器——2026-09-14 从三面实现中抽出）、`src/recon.ts`/`src/attack.ts`/`src/crack.ts`（三面实现：校验 → 工具探测 → 执行）；构建产物 `lib/*.js`（`tsc -p tsconfig.json`）。
+- 测试：`tests/commands.test.mjs`（20 用例，离线跑 `lib/` 产物，不触碰 WSL/网络）。
 - 同语义副本：无（本文件为唯一主副本）。
-- 未实现/未验证部分显式标注：**无测试套件**（`package.json` 无 `test` 脚本、无 `tests/`）——§7 中标「待验收」的条目当前**没有任何自动化防线**；`Config` 只有 `enabled` 且不影响注册。
+- 未实现/未验证部分显式标注：~~**无测试套件**~~ **已补（2026-09-14）**；A10/A11 属**真实执行**行为（依赖 WSL 内已装工具），仍需线上验收；`Config` 只有 `enabled` 且不影响注册（A9 已证伪，见 §10 U2）。
 - **生效判据**：① 改代码后 `npm run build`，比对 `lib/index.js` 的 mtime 与 web 进程启动时刻（`.dsh/plugin-boot.jsonl` 末行 `processStartMs`）——产物晚于进程启动即证明**新代码未被加载**，需重启；② 组合自报 `plugin_boot_status` 的 `stale` 清单为空；③ 工具级：会话内 `sec_*` 可答（返回 `{ok,...}` 结构，而非「工具不存在」）即插件已激活；④ 行为级：`sec_nmap` 对已知目标返回实际端口输出。
 - **回退**：① 代码回退 `git -C E:/alice/self-plugins/dsh-sec-tools revert <sha>` + 重新 `npm run build`，再经哨兵协议重启使新构建生效；② 版本回退按 package version（当前 `0.1.0`）；③ 结构性回退 `plugin_unmount`（插件名 `dsh-sec-tools`）——11 个工具从工具面消失，WSL 侧工具与已装环境不受影响；④ 单点应急：组合行里给 `config.enabled: false` **不能**关闭工具（见 A9 证伪），要停用只能走 `plugin_stop`/卸载。
 
@@ -122,9 +128,20 @@
   - 语义**被修正**：README「配置：`wslDistro` 默认 Ubuntu」**与实现不符**——源码无该字段且发行版硬编码（`wsl.ts:27`）；同时 `enabled` 的语义务必写清：它只是就绪日志开关，不是功能开关
   - 教训（同时回写技能 `semantic-doc-first`）：README 面向使用者、语义文档面向实现者——**两者的字段清单必须分别与源码核对**，不能互为依据
 
+- **2026-09-14 可维护性补课（批次 W3）：命令构造抽纯 + 20 测试 + 修 hydra 凭据缺陷 + 新增元字符闸门**
+  - 语义**被确认**：`sq()` 转义正确（`'` → `'\''`）；`validUrl`/`validTarget`/`validWord` 对非法输入返回 `{ok:false}`/`false` 而不抛错；A8 的 `wslDistro` 证伪复核通过（本插件源码 0 命中，`wsl.ts` 硬编码 Ubuntu）。
+  - 语义**被补充**：命令构造器 `build*Cmd`（11 个）与校验原语一并抽出为 `src/commands.ts`——`recon.ts` 以 `export { … } from './commands.js'` 转出旧名字，**既有导入路径与签名不变**（attack/crack/index 无需改 import）。
+  - 语义**被修正（真缺陷，先证伪后修）**：`hydra` 在 `user`+`pass` 同时给定时把密码拼两遍（`hydra 'u':'p':'p'`）；hydra 按首个冒号切分 ⇒ 密码成为 `p:p`，**凭据永远不匹配**（表现为「跑通了但没结果」，最易被误读为「密码确实错」）。修复：仅在未走 `user+pass` 分支时补密码段。
+  - 语义**被修正（安全加固，防线新增）**：`nmap.extra` / `nmap.scanType` / `masscan.ports` / `gobuster.mode` / `sqlmap.extra` / `hydra.service` 六个参数**原样拼进命令行**（不加引号，为保持多参数展开语义）——意味着 `extra: '; id'` 之类可直接执行任意命令。新增 `hasShellMeta`/`unsafeArg` 闸门，在**触碰 WSL 之前**拒绝含 `; | & \` $ ( ) { } < > " ' \` 与换行的取值；不含空格，故合法多参数（如 `-O -A`）不受影响。
+  - 语义**被修正（文档级）**：README 的「配置 `wslDistro`」仍未实现（§10 U1 保持开放）——本次**未改 README**（不在本批次写域），仅在此复核并保持证伪记录。
+  - 教训：**「参数一律 sq() 包裹」这类安全断言必须逐参数核对**——A3 原写「参数一律 `sq()` 包裹」是**不成立**的（6 个参数原样拼接）；单测把「哪些参数有包裹、哪些靠闸门」逐条锁死后，这条断言才第一次成为事实。
+
 ## 10 · 未决问题
 
 - **U1** `wslDistro` 缺位：是补实现（把发行版做成配置字段）还是修 README（写明硬编码 Ubuntu）？我倾向**补实现**（多发行版环境更稳），但需主人裁决是否需要。
 - **U2** `enabled=false` 的语义歧义：直觉预期是「停用工具面」，实现只是关日志。是否需要把 `enabled` 接入注册门控，或改为 `logReadyOnly` 之类名副其实的字段名？
 - **U3** 无单测：`sq`/`validUrl`/`validTarget`/命令构造是否抽成纯函数并配 `node --test` 离线用例（可在不碰 WSL 的前提下验证注入防护）？
+  → **已闭环（2026-09-14）**：`src/commands.ts` + `tests/commands.test.mjs`（20 用例）；A12–A16 全绿。命令构造与校验现已可离线全量验证（runX 只剩接线）。
+- **U5** 原样拼接参数的闸门是否够（本次新增登记）：`unsafeArg` 只挡元字符，不挡「合法但危险」的参数（如 `--os-shell`、`--script=*`、`-p-` 全端口）。是否需要白名单式参数校验？倾向：保持现闸门（防注入）+ 在工具 description 里显式声明「危险参数自担」，不在插件层做策略判断。
+- **U6** `number` 参数未做运行时类型校验（本次新增登记）：`port`/`threads`/`level`/`risk`/`tune`/`agility` 若被传字符串（绕过工具 schema）会原样进命令行。倾向：与 U5 一并评估——若要挡，需在 runX 加 `Number.isInteger` 检查（`commands.ts` 已有位置）。
 - **U4** 「有 stdout 即判成功」的失败判据（`!r.ok && !r.stdout`）会把部分失败当成功——是否改为暴露 `ok` 与 `exitCode` 双语义由调用者裁决？
