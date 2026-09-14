@@ -1,0 +1,130 @@
+# 语义文档：dsh-sec-tools（安全工具面封装）
+
+> 能力名：dsh-sec-tools（插件导出 `name = 'dsh-sec-tools'`，`src/index.ts:27`）
+> 主副本路径：`self-plugins/dsh-sec-tools/docs/semantic.md`（本文件）
+> 实现落点：`self-plugins/dsh-sec-tools/src/index.ts`（工具注册 + 统一包装）· `src/wsl.ts`（WSL 子进程基础设施）· `src/recon.ts`（侦察面 6 工具）· `src/attack.ts`（利用面 3 工具）· `src/crack.ts`（密码面 2 工具）
+> 版本 v0.1.0（`package.json`） · 2026-09-14 · 作者：爱丽丝 · 状态：**draft**
+> 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
+
+---
+
+## 1 · 定位与反定位
+
+**定位**：把 WSL 里成熟的渗透测试工具（nmap/masscan/gobuster/subfinder/whatweb/dnsrecon/sqlmap/nikto/hydra/hashcat/john）封装为 **11 个结构化 DSH 工具**——参数结构化传入、经 `wsl.exe` 在 WSL 内执行、输出结构化返回，使模型调用成熟工具而不是自己拼命令。
+
+**反定位（本文不管什么）**：
+- 不管侦察/利用原语本身（`dsh-red-team` 管原语、`dsh-exploit-kit` 管利用链；本插件只管「成熟工具调用」）
+- 不管目标授权流程（授权判断归使用者；插件只在每个工具 `description` 内置 boundary 声明）
+- 不管 WSL 环境本身（发行版/工具安装是环境前提；缺工具时工具返回明确错误）
+- **不是沙箱，也不是授权机制**：它拦不住被调用工具的全部行为——只做参数级防注入与存在性预检
+
+## 2 · 术语表
+
+| 术语 | 含义 |
+|------|------|
+| spawnWsl | `src/wsl.ts:22`：把命令 base64 编码后经 echo <b64> \| base64 -d \| bash 执行（规避 `wsl.exe` 的 argv 重解析破坏） |
+| 目标面分组 | 侦察面（recon，6）· 利用面（attack，3）· 密码面（crack，2） |
+| `sq()` | `src/recon.ts:11`：单引号包裹并把 `'` 转义为 `'\''`（bash 内防注入） |
+| 预检 | 调用工具前先 `toolExists()`（`wsl.ts:45`）/`fileExists()`（`recon.ts:33`），缺失即返回明确错误 |
+| outcome | 统一返回字段：`ok / error / result / exitCode / stderr / durationMs`（`index.ts:65` `baseProps`） |
+| enabled | 唯一配置字段（`index.ts:31`）：**仅控制就绪日志**，不影响工具注册 |
+
+## 3 · 概念模型
+
+```
+模型 / 会话 ──调用 sec_* ──► execute（wrapExecute 包一层，index.ts:44）
+                                └─ run*()（recon/attack/crack）
+                                     ├─ 参数校验（validTarget / validUrl / sq）
+                                     ├─ toolExists 预检 ──缺工具即返回 {ok:false,error:'WSL 未安装 X'}
+                                     └─ spawnWsl(cmd, timeoutMs)  → wsl.exe -d Ubuntu -- bash -c "echo <b64> | base64 -d | bash"
+返回 {ok,error,result,exitCode,stderr,durationMs} ──► output.schema 校验 ──► render 人类可读文本
+```
+
+不变量（invariants）：
+1. **I1 传参不破**：命令一律走 base64 通道（`wsl.ts:24`），`$`/引号/多行不丢——不允许直接拼 `wsl.exe -- <cmd>` 的 argv
+2. **I2 参数先校验后执行**：target/url/wordlist 路径在构命令前过校验（`validTarget`/`validUrl`/`sq`），拒绝含 shell 元字符的输入
+3. **I3 返回无损**：`undefined` 统一置 `null`（`index.ts:48` 注释：`undefined` 会被 `JSON.stringify` 丢弃导致 schema 校验失败）
+4. **I4 schema 严格**：`additionalProperties:false` + `ok` 必填；所有工具共享 `outSchema()`（`index.ts:69`）
+5. **I5 失败必达**：`execute` 全程 `try/catch`，异常转 `{ok:false,error}` 返回，不抛出到调用方（`index.ts:57`）
+
+## 4 · 契约
+
+### 4.1 服务与配置
+- 依赖：`inject = ['tools']`（`index.ts:28`）；配置 `Config = z.object({ enabled: z.boolean().default(true) })`（`index.ts:31`）
+- 组合行：`.dsh/profiles/web/cordis.patch.yml:186`（`id: agent-sec-tools`，未写 `config` → `enabled=true`）
+- WSL 目标发行版：**硬编码 `'Ubuntu'`**（`wsl.ts:27`）——源码中不存在 `wslDistro` 配置字段（`README.md:62` 的声明与实现不符，见 §9/§10）
+- 超时档位：`DEFAULT_TIMEOUT = 120_000`、`LONG_TIMEOUT = 600_000`（`wsl.ts:51`）；实际默认值——nmap/masscan/gobuster/subfinder/whatweb/dnsrecon = 120s，sqlmap/nikto/hashcat/john = 600s，hydra = 300s
+
+### 4.2 输出契约
+`outSchema()` 字段：`ok`(boolean,必填) / `error` / `result` / `exitCode` / `stderr` / `durationMs`；`render`（`index.ts:36` `wrapRender`）在 `ok=false` 时只输出 `error`，否则输出 `result` + `[stderr]`(截 300 字) + `[exit N · Tms]`。
+
+### 4.3 调用点清单 `[MUST]`
+
+| 调用方 | 调用点（文件:符号） | 时机 |
+|-------|------------------|------|
+| cordis 组合层 | `.dsh/profiles/web/cordis.patch.yml:186`（`id: agent-sec-tools`） | web 启动装配 |
+| 插件 | `src/index.ts:27` `name='dsh-sec-tools'` / `:28` `inject=['tools']` / `:31` `Config` | 装配与激活门 |
+| 插件 | `src/index.ts:62` `apply()` → `:64` `reg()` × 11 → `ctx.tools.register(defineTool(...))` | apply 一次 |
+| 模型 / 会话 | `sec_nmap` `:77`｜`sec_masscan` `:93`｜`sec_gobuster` `:106`｜`sec_subfinder` `:120`｜`sec_whatweb` `:133`｜`sec_dnsrecon` `:145`｜`sec_sqlmap` `:159`｜`sec_nikto` `:180`｜`sec_hydra` `:192`｜`sec_hashcat` `:216`｜`sec_john` `:235` | 每次调用 |
+| 插件包装 | `src/index.ts:44` `wrapExecute` / `:36` `wrapRender` / `:69` `outSchema` | 每次工具调用 |
+| 侦察面实现 | `src/recon.ts:51` `runNmap`｜`:74` `runMasscan`｜`:98` `runGobuster`｜`:122` `runSubfinder`｜`:142` `runWhatweb`｜`:162` `runDnsrecon` | 对应工具 execute |
+| 利用面实现 | `src/attack.ts:31` `runSqlmap`｜`:60` `runNikto`｜`:94` `runHydra` | 对应工具 execute |
+| 密码面实现 | `src/crack.ts:29` `runHashcat`｜`:55` `runJohn` | 对应工具 execute |
+| 进程执行层 | `src/wsl.ts:22` `spawnWsl`（base64 通道）→ `wsl.exe -d Ubuntu -- bash -c` | 每次子进程 |
+| 预检 | `src/wsl.ts:45` `toolExists` / `src/recon.ts:33` `fileExists`（john 前置） | 构命令后、执行前 |
+| 参数校验 | `src/recon.ts:11` `sq` / `:16` `validUrl` / `:23` `validTarget` / `:28` `validWord` | 每次构命令前 |
+| 日志 | `src/index.ts:63` `ctx.logger('sec-tools')` · `:248` 就绪自报「11 工具：6 侦察 + 3 利用 + 2 密码」 | apply |
+
+## 5 · 边界与信任
+
+- **能力边界 ≠ 沙箱**：本插件防的是参数注入（`sq` 包裹 + URL/target 白名单校验）与工具缺失（预检）；**不防**被调用工具自身的行为、不防误用授权范围。
+- 不越界清单：不做目标可达性探测以外的信息收集（侦察面仅封装既有工具）｜不默认开启危险参数（sqlmap 的 `os-shell` 不在默认集，`extra` 走调用者自负）｜不落盘凭据（破解产出原样透出 stdout）｜仅限自有/授权/靶场环境（每个工具 `description` 内置 boundary 文案）。
+- 失败面：工具未安装 → `{ok:false,error:'WSL 未安装 X'}`；参数非法 → 校验错误文本；执行失败但**有 stdout** → 判 `ok:true`（`if (!r.ok && !r.stdout)` 判据，保留部分结果）；spawn 异常/超时 → `exitCode=-1` 或 `null`，`stderr` 带错误文本；哈希文件不存在（john）→ 明确报错。坏数据一律「拒绝 + 报错」，无静默吞错分支。
+
+## 6 · 与既有机制的关系
+
+- **DSH 组合变更（AGENTS.md §5.11）**：改 `src/**` 属组合变更——构建产物 `lib/index.js` 新于 web 进程启动时，`preflight_check` 判「有未验证构建」并强制完整试运行。
+- **命令准则（AGENTS.md §5.1）**：插件本身即「命令行默认走 WSL2」的工程化——`wsl.exe -d Ubuntu -- bash -c`，与主人定调的调用链一致。
+- **与同族插件**：`dsh-red-team`（侦察原语）/ `dsh-exploit-kit`（利用原语）/ `dsh-cyber-range`（靶场）互补；`spawnWsl` 的 base64 通道设计来源即这两者的教训（`src/wsl.ts:4` 注释）。
+- **预检与哨兵**：装配改动经哨兵协议（预检 → kill+重启 → 唤醒）。
+
+## 7 · 可证伪验收清单
+
+| # | 可证伪命题 | 证据（单测名/命令/日志行） | 状态 |
+|---|-----------|------------------------------|------|
+| A1 | 工具面恰为 11 个 `sec_*` 且分三面（6+3+2） | `rg -n "name: 'sec_" src/` → 11 命中（index.ts:77/93/106/120/133/145/159/180/192/216/235） | 已实测 |
+| A2 | 命令经 base64 通道传递，不走 argv 直传 | 源码 `src/wsl.ts:24-27`：echo <b64> \| base64 -d \| bash | 已实测 |
+| A3 | 无 shell 字符串拼接工具调用，参数一律 `sq()` 包裹 | 源码 `src/recon.ts:11` + 各 `run*` 的 `cmd` 构造 | 已实测 |
+| A4 | URL/目标校验拒绝 shell 元字符与非法格式 | 源码 `src/recon.ts:16-25`（`validUrl` 以正则拒绝 shell 元字符：分号/竖线/与号/反引号/美元符/括号/尖括号/引号/反斜杠/空白；`validTarget` 要求 `^[a-zA-Z0-9.-]+$` 且含 `.` 且不以 `-` 开头） | 已实测 |
+| A5 | 返回字段无损（`undefined` → `null`，过严格 schema） | 源码 `src/index.ts:44-60` + `outSchema`（`additionalProperties:false`） | 已实测 |
+| A6 | 组合已挂载且无构建滞后 | `.dsh/plugin-boot.jsonl` 末行 `live[]` 含 `dsh-sec-tools`、`stale[]` 为空 | 已实测 |
+| A7 | 本实例跑的就是当前构建 | `lib/index.js` mtime = 2026-08-25 22:21:18 ＜ web 进程启动 = 2026-09-14 10:05:47（`plugin-boot.jsonl` 末行 `processStartMs=1789351547742`） | 已实测 |
+| A8 | 配置项 `wslDistro` 存在且可切发行版（README 声明） | **证伪**：`rg -n "wslDistro" src/` → 0 命中；`wsl.ts:27` 硬编码 `'Ubuntu'` | 已实测（证伪，见 §9/§10） |
+| A9 | `enabled=false` 会禁用工具面（直觉预期） | **证伪**：`src/index.ts:247` 仅 `if (config.enabled) logger.info(...)`——工具照常注册 | 已实测（证伪，见 §10） |
+| A10 | 缺工具时返回明确错误而非崩溃 | 在 WSL 内临时隐藏某工具（如 `PATH` 剔除）后调用对应 `sec_*`，应得 `{ok:false,error:'WSL 未安装 X'}` | 待验收 |
+| A11 | 真实扫描可跑通并结构化返回 | 线上跑 `sec_nmap {target: 'scanme.nmap.org'}`：`ok=true`、`exitCode` 与 `result` 含端口列表、`durationMs>0` | 待验收 |
+
+## 8 · 与实现的关系
+
+- 主实现：`src/index.ts`（注册/包装/渲染）、`src/wsl.ts`（执行）、`src/recon.ts`/`src/attack.ts`/`src/crack.ts`（三面实现）；构建产物 `lib/*.js`（`tsc -p tsconfig.json`）。
+- 同语义副本：无（本文件为唯一主副本）。
+- 未实现/未验证部分显式标注：**无测试套件**（`package.json` 无 `test` 脚本、无 `tests/`）——§7 中标「待验收」的条目当前**没有任何自动化防线**；`Config` 只有 `enabled` 且不影响注册。
+- **生效判据**：① 改代码后 `npm run build`，比对 `lib/index.js` 的 mtime 与 web 进程启动时刻（`.dsh/plugin-boot.jsonl` 末行 `processStartMs`）——产物晚于进程启动即证明**新代码未被加载**，需重启；② 组合自报 `plugin_boot_status` 的 `stale` 清单为空；③ 工具级：会话内 `sec_*` 可答（返回 `{ok,...}` 结构，而非「工具不存在」）即插件已激活；④ 行为级：`sec_nmap` 对已知目标返回实际端口输出。
+- **回退**：① 代码回退 `git -C E:/alice/self-plugins/dsh-sec-tools revert <sha>` + 重新 `npm run build`，再经哨兵协议重启使新构建生效；② 版本回退按 package version（当前 `0.1.0`）；③ 结构性回退 `plugin_unmount`（插件名 `dsh-sec-tools`）——11 个工具从工具面消失，WSL 侧工具与已装环境不受影响；④ 单点应急：组合行里给 `config.enabled: false` **不能**关闭工具（见 A9 证伪），要停用只能走 `plugin_stop`/卸载。
+
+## 9 · 实践修订记录
+
+（I3：每次事故/实践暴露的语义缺口当场回写）
+
+- 2026-09-14 补课：本插件此前无语义文档（可维护性工程）
+  - 语义**被确认**：11 工具三面划分、`inject=['tools']`、base64 通道、统一 outcome 七字段、失败判据 `!r.ok && !r.stdout`
+  - 语义**被补充**：§4.1 补齐真实超时档位（120s / 300s / 600s）与「发行版硬编码 Ubuntu」这一实现事实；§5 失败面按源码逐条列出
+  - 语义**被修正**：README「配置：`wslDistro` 默认 Ubuntu」**与实现不符**——源码无该字段且发行版硬编码（`wsl.ts:27`）；同时 `enabled` 的语义务必写清：它只是就绪日志开关，不是功能开关
+  - 教训（同时回写技能 `semantic-doc-first`）：README 面向使用者、语义文档面向实现者——**两者的字段清单必须分别与源码核对**，不能互为依据
+
+## 10 · 未决问题
+
+- **U1** `wslDistro` 缺位：是补实现（把发行版做成配置字段）还是修 README（写明硬编码 Ubuntu）？我倾向**补实现**（多发行版环境更稳），但需主人裁决是否需要。
+- **U2** `enabled=false` 的语义歧义：直觉预期是「停用工具面」，实现只是关日志。是否需要把 `enabled` 接入注册门控，或改为 `logReadyOnly` 之类名副其实的字段名？
+- **U3** 无单测：`sq`/`validUrl`/`validTarget`/命令构造是否抽成纯函数并配 `node --test` 离线用例（可在不碰 WSL 的前提下验证注入防护）？
+- **U4** 「有 stdout 即判成功」的失败判据（`!r.ok && !r.stdout`）会把部分失败当成功——是否改为暴露 `ok` 与 `exitCode` 双语义由调用者裁决？
